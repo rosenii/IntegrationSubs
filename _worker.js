@@ -1,19 +1,22 @@
 // _workers.js – Cloudflare Worker (ES modules format)
-// 
+//
 // 部署说明：
-// 1. 在 Cloudflare Dashboard 中创建 KV 命名空间（名称随意，例如 SINGBOX_CONFIG）
-// 2. 在 Worker 设置中绑定该 KV，变量名设为 SUB_CONFIG
-// 3. 若未绑定 KV，将回退到内存存储（重启后丢失，不推荐）
+// 1. (可选) 创建 KV 命名空间并绑定到变量 SUB_CONFIG，用于永久存储订阅配置。
+//    如未绑定，将使用内存存储（重启丢失，但订阅链接仍可临时使用）。
+// 2. 直接部署即可，前端与后端同文件。
 
-// 内存缓存，用于无 KV 时的临时分享
+// 内存缓存（无 KV 时回退）
 const memoryStore = new Map();
+
+// 需要排除的出站类型（后端使用）
+const EXCLUDED_TYPES = ['direct', 'selector', 'urltest', 'dns', 'block'];
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // 处理 CORS 预检
+    // CORS 预检
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -24,34 +27,124 @@ export default {
       });
     }
 
-    // 主页：返回前端界面
+    // 主页 HTML
     if (path === '/' && request.method === 'GET') {
       return new Response(getHTML(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
     }
 
-    // 获取永久订阅链接（返回最新配置）
-    if (path === '/api/latest' && request.method === 'GET') {
-      return handleGetLatest(env);
+    // 后端拉取代理节点 API
+    if (path === '/api/fetch' && request.method === 'POST') {
+      return handleFetchProxies(request);
     }
 
-    // 更新永久订阅链接配置
+    // 更新永久订阅配置
     if (path === '/api/update' && request.method === 'POST') {
       return handleUpdateLatest(request, env);
     }
 
-    // 保留旧的临时分享接口（兼容）
-    if (path.startsWith('/api/get/') && request.method === 'GET') {
-      const id = path.split('/api/get/')[1];
-      return handleGetTempConfig(id);
+    // 获取永久订阅配置
+    if (path === '/api/latest' && request.method === 'GET') {
+      return handleGetLatest(env);
     }
 
     return new Response('Not Found', { status: 404 });
   },
 };
 
-// 获取永久订阅配置（优先从 KV 读取）
+// 后端拉取多个订阅源并过滤代理节点
+async function handleFetchProxies(request) {
+  try {
+    const body = await request.json();
+    const { sources } = body;
+    if (!Array.isArray(sources) || sources.length === 0) {
+      throw new Error('至少需要一个订阅源');
+    }
+
+    const fetchTasks = sources.map(async (src) => {
+      const { name, url, type = 'selector' } = src;
+      try {
+        const resp = await fetch(url, {
+          headers: { 'User-Agent': 'Cloudflare-Worker-SubMerger/1.0' },
+        });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const text = await resp.text();
+
+        let outbounds = [];
+        const data = JSON.parse(text);
+        if (Array.isArray(data)) {
+          outbounds = data;
+        } else if (data && Array.isArray(data.outbounds)) {
+          outbounds = data.outbounds;
+        } else {
+          throw new Error('无法识别的格式');
+        }
+
+        const filtered = outbounds.filter(ob => {
+          if (!ob || typeof ob !== 'object') return false;
+          return !EXCLUDED_TYPES.includes(ob.type);
+        });
+
+        const proxies = filtered.map(ob => ({
+          ...ob,
+          tag: ob.tag || 'unnamed',
+        }));
+
+        const tags = proxies.map(p => p.tag);
+        if (tags.length === 0) {
+          return { name, proxies: [], group: null, error: '该源无有效代理节点' };
+        }
+
+        const group = {
+          type: type,
+          tag: name,
+          outbounds: tags,
+          default: tags[0],
+        };
+
+        return { name, url, proxies, group, error: null };
+      } catch (err) {
+        return { name, url, proxies: [], group: null, error: err.message };
+      }
+    });
+
+    const results = await Promise.all(fetchTasks);
+    return new Response(JSON.stringify({ results }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+    });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: err.message }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+    });
+  }
+}
+
+// 更新永久订阅配置（KV 或内存）
+async function handleUpdateLatest(request, env) {
+  try {
+    const body = await request.json();
+    const configStr = JSON.stringify(body);
+    const kv = env.SUB_CONFIG;
+    if (kv) {
+      await kv.put('latest', configStr);
+    } else {
+      memoryStore.set('latest', configStr);
+    }
+    return new Response(JSON.stringify({ success: true }), {
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+    });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: err.message }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+    });
+  }
+}
+
+// 获取永久订阅配置
 async function handleGetLatest(env) {
   const kv = env.SUB_CONFIG;
   if (kv) {
@@ -67,7 +160,6 @@ async function handleGetLatest(env) {
     }
     return new Response('尚未生成任何配置', { status: 404 });
   }
-  // 回退到内存
   const config = memoryStore.get('latest');
   if (config) {
     return new Response(config, {
@@ -81,49 +173,7 @@ async function handleGetLatest(env) {
   return new Response('尚未生成任何配置', { status: 404 });
 }
 
-// 更新永久订阅配置（存入 KV 或内存）
-async function handleUpdateLatest(request, env) {
-  try {
-    const body = await request.json();
-    const configStr = JSON.stringify(body);
-    const kv = env.SUB_CONFIG;
-    if (kv) {
-      await kv.put('latest', configStr);
-    } else {
-      memoryStore.set('latest', configStr);
-    }
-    return new Response(JSON.stringify({ success: true }), {
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-      },
-    });
-  } catch (err) {
-    return new Response(JSON.stringify({ error: err.message }), {
-      status: 400,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-      },
-    });
-  }
-}
-
-// 旧的临时分享接口
-function handleGetTempConfig(id) {
-  const config = memoryStore.get(id);
-  if (!config) {
-    return new Response('Config not found or expired', { status: 404 });
-  }
-  return new Response(config, {
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-    },
-  });
-}
-
-// 前端 HTML（包含永久链接显示与持久化缓存）
+// 前端 HTML（调用 /api/fetch 获取代理，其余功能保持不变）
 function getHTML() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -340,7 +390,7 @@ function getHTML() {
       <p id="no-link-hint" style="color: #6e6e73;">尚未生成配置，请点击下方按钮。</p>
     </div>
     <p style="font-size: 0.8rem; color: #8e8e93;">
-      <strong>注意：</strong>需绑定 Cloudflare KV 以实现永久存储（否则链接可能在 Worker 重启后失效）。<br>
+      <strong>注意：</strong>绑定 Cloudflare KV 可实现永久存储（否则链接可能在 Worker 重启后失效）。<br>
       部署时创建 KV 命名空间并绑定到变量 <code>SUB_CONFIG</code>。
     </p>
   </div>
@@ -383,7 +433,7 @@ function getHTML() {
     (function() {
       // ========== IndexedDB 存储 ==========
       const DB_NAME = 'singbox-merger';
-      const DB_VERSION = 3;  // 升级版本，增加永久链接存储
+      const DB_VERSION = 3;
       const CONFIG_STORE = 'config';
       const CACHE_STORE = 'proxyCache';
       const META_STORE = 'meta';
@@ -429,8 +479,7 @@ function getHTML() {
             tx.onerror = () => reject(tx.error);
           });
         } catch (e) {
-          console.warn('IndexedDB 保存配置失败', e);
-          try { localStorage.setItem('singbox_merger_config', text); } catch (_) {}
+          console.warn('IndexedDB save config failed', e);
         }
       }
 
@@ -445,12 +494,12 @@ function getHTML() {
             request.onerror = () => reject(request.error);
           });
         } catch (e) {
-          console.warn('IndexedDB 加载配置失败', e);
-          return localStorage.getItem('singbox_merger_config') || '';
+          console.warn('IndexedDB load config failed', e);
+          return '';
         }
       }
 
-      // 代理缓存
+      // 代理缓存（以 url 为键）
       async function saveProxyCache(url, proxies, group) {
         try {
           const database = await openDB();
@@ -462,7 +511,7 @@ function getHTML() {
             tx.onerror = () => reject(tx.error);
           });
         } catch (e) {
-          console.warn('保存代理缓存失败', e);
+          console.warn('Save proxy cache failed', e);
         }
       }
 
@@ -477,7 +526,7 @@ function getHTML() {
             request.onerror = () => reject(request.error);
           });
         } catch (e) {
-          console.warn('读取代理缓存失败', e);
+          console.warn('Get proxy cache failed', e);
           return null;
         }
       }
@@ -494,7 +543,7 @@ function getHTML() {
             tx.onerror = () => reject(tx.error);
           });
         } catch (e) {
-          console.warn('保存永久链接失败', e);
+          console.warn('Save permanent link failed', e);
         }
       }
 
@@ -513,7 +562,7 @@ function getHTML() {
         }
       }
 
-      // ========== localStorage 存储订阅源列表 ==========
+      // ========== localStorage (订阅源列表) ==========
       const STORAGE_KEY_SOURCES = 'singbox_merger_sources';
 
       function loadSources() {
@@ -538,7 +587,6 @@ function getHTML() {
       const refreshGenerateBtn = document.getElementById('refresh-generate');
       const downloadBtn = document.getElementById('download');
       const copyResultBtn = document.getElementById('copy-result');
-      const copyLinkBtn = document.getElementById('copy-link');
       const configInput = document.getElementById('config-input');
       const outputArea = document.getElementById('output');
       const resultDiv = document.getElementById('result');
@@ -549,7 +597,6 @@ function getHTML() {
       const copyPermanentLinkBtn = document.getElementById('copy-permanent-link');
       const noLinkHint = document.getElementById('no-link-hint');
 
-      // 永久订阅链接基础
       const permanentLinkBase = location.origin + '/api/latest';
 
       function collectSources() {
@@ -575,21 +622,20 @@ function getHTML() {
         }, 300);
       }
 
-      // 更新永久链接显示
       function updateSubscriptionLinkDisplay() {
         subscriptionLinkText.textContent = permanentLinkBase;
         subscriptionLinkBox.style.display = 'flex';
         noLinkHint.style.display = 'none';
       }
 
-      // 缓存状态指示器
+ // 缓存状态指示器
       async function updateCacheStatusIndicators() {
         const rows = document.querySelectorAll('.source-row');
-        rows.forEach(async (row) => {
+        for (const row of rows) {
           const urlInput = row.querySelector('.url');
-          if (!urlInput) return;
+          if (!urlInput) continue;
           const url = urlInput.value.trim();
-          if (!url) return;
+          if (!url) continue;
           const cache = await getProxyCache(url);
           let statusSpan = row.querySelector('.cache-status');
           if (!statusSpan) {
@@ -603,7 +649,7 @@ function getHTML() {
           } else {
             statusSpan.textContent = '无缓存';
           }
-        });
+        }
       }
 
       function createSourceRow(name = '', url = '', type = 'selector') {
@@ -626,14 +672,8 @@ function getHTML() {
         });
 
         div.querySelectorAll('input, select').forEach(el => {
-          el.addEventListener('input', () => {
-            scheduleSave();
-            updateCacheStatusIndicators();
-          });
-          el.addEventListener('change', () => {
-            scheduleSave();
-            updateCacheStatusIndicators();
-          });
+          el.addEventListener('input', scheduleSave);
+          el.addEventListener('change', scheduleSave);
         });
 
         return div;
@@ -647,12 +687,12 @@ function getHTML() {
         updateCacheStatusIndicators();
       }
 
+      // 初始化页面
       async function initFromCache() {
         const sources = loadSources();
         renderSources(sources);
         const savedConfig = await loadConfigFromDB();
         configInput.value = savedConfig;
-        // 加载并显示永久链接
         const savedLink = await loadPermanentLink();
         if (savedLink) {
           subscriptionLinkText.textContent = savedLink;
@@ -670,7 +710,6 @@ function getHTML() {
 
       configInput.addEventListener('input', scheduleSave);
 
-      // 文件导入
       importFileBtn.addEventListener('click', () => {
         const input = document.createElement('input');
         input.type = 'file';
@@ -688,7 +727,6 @@ function getHTML() {
         input.click();
       });
 
-      // 复制永久链接
       copyPermanentLinkBtn.addEventListener('click', async () => {
         try {
           await navigator.clipboard.writeText(subscriptionLinkText.textContent);
@@ -700,7 +738,6 @@ function getHTML() {
         }
       });
 
-      // 安全的 JSON 解析
       function parseJSONSafe(text) {
         let fixed = text.replace(/,(\\s*[}\\]])/g, '$1');
         try {
@@ -710,67 +747,26 @@ function getHTML() {
         }
       }
 
-      // 拉取单个源，支持缓存
-      async function fetchSourceProxies(source, forceRefresh = false) {
-        const { name, url, type } = source;
-        if (!forceRefresh) {
-          const cached = await getProxyCache(url);
-          if (cached) {
-            return { name, url, type, proxies: cached.proxies, group: cached.group, fromCache: true, error: null };
-          }
-        }
-
+      // 从后端拉取一个源的代理（必要时缓存）
+      async function fetchSourceProxiesFromBackend(sources) {
         try {
-          const resp = await fetch(url, {
-            headers: { 'User-Agent': 'Cloudflare-Worker-SubMerger/1.0' },
+          const response = await fetch('/api/fetch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sources }),
           });
-          if (!resp.ok) throw new Error('HTTP ' + resp.status);
-          const text = await resp.text();
-
-          let outbounds = [];
-          const data = JSON.parse(text);
-          if (Array.isArray(data)) {
-            outbounds = data;
-          } else if (data && Array.isArray(data.outbounds)) {
-            outbounds = data.outbounds;
-          } else {
-            throw new Error('无法识别的格式（需为数组或包含 outbounds 的对象）');
+          if (!response.ok) {
+            const err = await response.json().catch(() => ({}));
+            throw new Error(err.error || 'HTTP ' + response.status);
           }
-
-          const EXCLUDED_TYPES = ['direct', 'selector', 'urltest', 'dns', 'block'];
-          const filtered = outbounds.filter(ob => {
-            if (!ob || typeof ob !== 'object') return false;
-            return !EXCLUDED_TYPES.includes(ob.type);
-          });
-
-          const proxies = filtered.map(ob => ({
-            ...ob,
-            tag: ob.tag || 'unnamed',
-          }));
-
-          const tags = proxies.map(p => p.tag);
-          if (tags.length === 0) {
-            throw new Error('该源无有效代理节点');
-          }
-
-          const group = {
-            type: type,
-            tag: name,
-            outbounds: tags,
-            default: tags[0],
-          };
-
-          await saveProxyCache(url, proxies, group);
-          return { name, url, type, proxies, group, fromCache: false, error: null };
-        } catch (err) {
-          const cached = await getProxyCache(url);
-          if (cached) {
-            return { name, url, type, proxies: cached.proxies, group: cached.group, fromCache: true, error: err.message };
-          }
-          return { name, url, type, proxies: [], group: null, fromCache: false, error: err.message };
+          const data = await response.json();
+          return data.results; // 数组 [{name, url, proxies, group, error}]
+        } catch (e) {
+          throw e;
         }
       }
 
+      // 核心生成逻辑
       async function performGenerate(forceRefresh) {
         statusDiv.textContent = '';
         resultDiv.style.display = 'none';
@@ -804,16 +800,66 @@ function getHTML() {
         saveSources(sources);
         saveConfigToDB(configText);
 
-        statusDiv.textContent = '正在处理订阅源...';
-        const fetchTasks = sources.map(src => fetchSourceProxies(src, forceRefresh));
-        const results = await Promise.all(fetchTasks);
+        statusDiv.textContent = '正在请求后端拉取代理...';
 
+        // 决定哪些源需要从后端拉取（强制刷新则全部拉取，否则使用缓存）
+        const toFetch = [];
+        const fromCacheResults = [];
+
+        for (const src of sources) {
+          if (!forceRefresh) {
+            const cached = await getProxyCache(src.url);
+            if (cached) {
+              fromCacheResults.push({ ...src, proxies: cached.proxies, group: cached.group, fromCache: true, error: null });
+              continue;
+            }
+          }
+          toFetch.push(src);
+        }
+
+        let fetchedResults = [];
+        if (toFetch.length > 0) {
+          try {
+            fetchedResults = await fetchSourceProxiesFromBackend(toFetch);
+          } catch (e) {
+            // 后端整体请求失败，尝试对每个待拉取的源使用旧缓存
+            for (const src of toFetch) {
+              const cached = await getProxyCache(src.url);
+              if (cached) {
+                fromCacheResults.push({ ...src, proxies: cached.proxies, group: cached.group, fromCache: true, error: e.message });
+              } else {
+                fromCacheResults.push({ ...src, proxies: [], group: null, fromCache: false, error: e.message });
+              }
+            }
+            fetchedResults = [];
+          }
+        }
+
+        // 处理拉取结果，更新缓存
+        const allResults = [...fromCacheResults];
+        for (const res of fetchedResults) {
+          if (!res.error) {
+            // 成功拉取，更新缓存
+            await saveProxyCache(res.url, res.proxies, res.group);
+            allResults.push({ ...res, fromCache: false });
+          } else {
+            // 拉取失败，尝试使用旧缓存
+            const cached = await getProxyCache(res.url);
+            if (cached) {
+              allResults.push({ ...res, proxies: cached.proxies, group: cached.group, fromCache: true, error: res.error });
+            } else {
+              allResults.push({ ...res, fromCache: false });
+            }
+          }
+        }
+
+        // 合并出站列表
         const allProxies = [];
         const allGroups = [];
         const errors = [];
         const cacheWarnings = [];
 
-        results.forEach(res => {
+        allResults.forEach(res => {
           if (res.error) {
             if (res.fromCache) {
               cacheWarnings.push('[' + res.name + '] 拉取失败，使用缓存 (' + res.proxies.length + ' 节点)');
@@ -850,14 +896,13 @@ function getHTML() {
         const { outbounds: _, ...restConfig } = configObj;
         const finalConfig = { ...restConfig, outbounds: finalOutbounds };
 
-        // 显示结果
         const jsonStr = JSON.stringify(finalConfig, null, 2);
         outputArea.value = jsonStr;
         resultDiv.style.display = 'block';
         downloadBtn.style.display = 'inline-block';
         copyResultBtn.style.display = 'inline-block';
 
-        // 更新永久订阅链接到 KV/内存
+        // 更新永久订阅链接
         try {
           const resp = await fetch('/api/update', {
             method: 'POST',
@@ -865,7 +910,6 @@ function getHTML() {
             body: jsonStr,
           });
           if (resp.ok) {
-            // 更新本地存储的永久链接
             await savePermanentLink(permanentLinkBase);
             updateSubscriptionLinkDisplay();
           }
@@ -873,7 +917,6 @@ function getHTML() {
           console.warn('更新永久链接失败', e);
         }
 
-        // 下载
         downloadBtn.onclick = () => {
           const blob = new Blob([jsonStr], { type: 'application/json' });
           const a = document.createElement('a');
@@ -882,7 +925,6 @@ function getHTML() {
           a.click();
         };
 
-        // 复制 JSON
         copyResultBtn.onclick = async () => {
           try {
             await navigator.clipboard.writeText(jsonStr);
@@ -900,7 +942,6 @@ function getHTML() {
       generateBtn.addEventListener('click', () => performGenerate(false));
       refreshGenerateBtn.addEventListener('click', () => performGenerate(true));
 
-      // 初始化
       initFromCache();
     })();
   </script>
