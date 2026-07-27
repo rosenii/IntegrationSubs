@@ -1,6 +1,6 @@
-// _worker.js – Cloudflare Worker (ES modules format)
+// _workers.js – Cloudflare Worker (ES modules format)
 
-// 全局内存存储（用于临时保存生成的配置，提供可访问的订阅链接）
+// 内存缓存，用于临时分享订阅链接
 const configCache = new Map();
 
 export default {
@@ -18,30 +18,26 @@ export default {
       });
     }
 
-    // 主页：返回前端界面
     if (path === '/' && request.method === 'GET') {
       return new Response(getHTML(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
     }
 
-    // API 生成接口
     if (path === '/api/generate' && request.method === 'POST') {
       return handleGenerate(request);
     }
 
-    // 获取临时生成的配置（订阅链接）
     if (path.startsWith('/api/get/') && request.method === 'GET') {
       const id = path.split('/api/get/')[1];
       return handleGetConfig(id);
     }
 
-    // 其他路径 404
     return new Response('Not Found', { status: 404 });
   },
 };
 
-// 处理临时配置获取请求
+// 处理临时配置获取
 function handleGetConfig(id) {
   const config = configCache.get(id);
   if (!config) {
@@ -55,7 +51,7 @@ function handleGetConfig(id) {
   });
 }
 
-// 前端 HTML（包含 localStorage 缓存 + 复制链接功能）
+// 前端 HTML（IndexedDB 存储 + 文件导入）
 function getHTML() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -158,6 +154,11 @@ function getHTML() {
       background: #ff9500;
     }
     .link-btn:hover { background: #e68600; }
+    .import-btn {
+      background: #5856d6;
+      margin-left: 0.5rem;
+    }
+    .import-btn:hover { background: #4b49cc; }
 
     .code-editor {
       width: 100%;
@@ -232,7 +233,10 @@ function getHTML() {
 
   <div class="card">
     <h2>📦 其他配置 (不含或含 outbounds，都会保留)</h2>
-    <p style="color: #6e6e73; font-size: 0.85rem;">在此输入 Sing‑Box 配置的其余部分（JSON 对象），可包含 <code>outbounds</code> 字段，拉取的节点将追加到其后。</p>
+    <p style="color: #6e6e73; font-size: 0.85rem;">
+      在此输入 Sing‑Box 配置的其余部分（JSON 对象），可包含 <code>outbounds</code> 字段，拉取的节点将追加到其后。<br>
+      <strong>超大配置建议：</strong>点击 <button class="import-btn" id="import-file-btn" style="font-size:0.8rem; padding:0.2rem 0.6rem;">📂 从文件导入</button> 加载本地 JSON 文件。
+    </p>
     <textarea id="config-input" class="code-editor" placeholder='{
   "log": { "level": "info" },
   "inbounds": [...],
@@ -257,9 +261,69 @@ function getHTML() {
 
   <script>
     (function() {
-      // ---------- 缓存相关 ----------
+      // ========== IndexedDB 存储大文本 ==========
+      const DB_NAME = 'singbox-merger';
+      const DB_VERSION = 1;
+      const STORE_NAME = 'config';
+      const CONFIG_KEY = 'other_config';
+
+      let db = null;
+
+      function openDB() {
+        return new Promise((resolve, reject) => {
+          if (db) return resolve(db);
+          const request = indexedDB.open(DB_NAME, DB_VERSION);
+          request.onupgradeneeded = (event) => {
+            const database = event.target.result;
+            if (!database.objectStoreNames.contains(STORE_NAME)) {
+              database.createObjectStore(STORE_NAME, { keyPath: 'id' });
+            }
+          };
+          request.onsuccess = (event) => {
+            db = event.target.result;
+            resolve(db);
+          };
+          request.onerror = (event) => {
+            reject(event.target.error);
+          };
+        });
+      }
+
+      async function saveConfigToDB(text) {
+        try {
+          const database = await openDB();
+          const tx = database.transaction(STORE_NAME, 'readwrite');
+          const store = tx.objectStore(STORE_NAME);
+          store.put({ id: CONFIG_KEY, value: text });
+          return new Promise((resolve, reject) => {
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
+          });
+        } catch (e) {
+          console.warn('IndexedDB 保存失败，回退到 localStorage', e);
+          try { localStorage.setItem(STORAGE_KEY_CONFIG, text); } catch (_) {}
+        }
+      }
+
+      async function loadConfigFromDB() {
+        try {
+          const database = await openDB();
+          const tx = database.transaction(STORE_NAME, 'readonly');
+          const store = tx.objectStore(STORE_NAME);
+          const request = store.get(CONFIG_KEY);
+          return new Promise((resolve, reject) => {
+            request.onsuccess = () => resolve(request.result ? request.result.value : '');
+            request.onerror = () => reject(request.error);
+          });
+        } catch (e) {
+          console.warn('IndexedDB 加载失败，尝试 localStorage', e);
+          return localStorage.getItem(STORAGE_KEY_CONFIG) || '';
+        }
+      }
+
+      // ========== localStorage 存储订阅源列表 ==========
       const STORAGE_KEY_SOURCES = 'singbox_merger_sources';
-      const STORAGE_KEY_CONFIG = 'singbox_merger_config';
+      const STORAGE_KEY_CONFIG = 'singbox_merger_config'; // 仅作后备
 
       function loadSources() {
         try {
@@ -276,14 +340,6 @@ function getHTML() {
         localStorage.setItem(STORAGE_KEY_SOURCES, JSON.stringify(sourcesArray));
       }
 
-      function loadConfig() {
-        return localStorage.getItem(STORAGE_KEY_CONFIG) || '';
-      }
-
-      function saveConfig(text) {
-        localStorage.setItem(STORAGE_KEY_CONFIG, text);
-      }
-
       // UI 元素
       const sourcesContainer = document.getElementById('sources-container');
       const addBtn = document.getElementById('add-source');
@@ -295,8 +351,9 @@ function getHTML() {
       const outputArea = document.getElementById('output');
       const resultDiv = document.getElementById('result');
       const statusDiv = document.getElementById('status');
+      const importFileBtn = document.getElementById('import-file-btn');
 
-      let currentGeneratedId = null;  // 保存最近一次生成返回的 id
+      let currentGeneratedId = null;
 
       function collectSources() {
         const rows = document.querySelectorAll('.source-row');
@@ -317,7 +374,7 @@ function getHTML() {
         clearTimeout(saveTimeout);
         saveTimeout = setTimeout(() => {
           saveSources(collectSources());
-          saveConfig(configInput.value);
+          saveConfigToDB(configInput.value);  // 使用 IndexedDB
         }, 300);
       }
 
@@ -354,10 +411,11 @@ function getHTML() {
         });
       }
 
-      function initFromCache() {
+      async function initFromCache() {
         const sources = loadSources();
         renderSources(sources);
-        configInput.value = loadConfig();
+        const savedConfig = await loadConfigFromDB();
+        configInput.value = savedConfig;
       }
 
       addBtn.addEventListener('click', () => {
@@ -368,6 +426,25 @@ function getHTML() {
 
       configInput.addEventListener('input', scheduleSave);
 
+      // 文件导入功能
+      importFileBtn.addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json,.txt';
+        input.onchange = (e) => {
+          const file = e.target.files[0];
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = (ev) => {
+            configInput.value = ev.target.result;
+            scheduleSave();  // 触发保存
+          };
+          reader.readAsText(file);
+        };
+        input.click();
+      });
+
+      // 生成按钮逻辑
       generateBtn.addEventListener('click', async () => {
         statusDiv.textContent = '';
         resultDiv.style.display = 'none';
@@ -400,7 +477,7 @@ function getHTML() {
         }
 
         saveSources(sources);
-        saveConfig(configText);
+        saveConfigToDB(configText);
 
         statusDiv.textContent = '正在请求订阅源...';
         try {
@@ -426,7 +503,6 @@ function getHTML() {
           downloadBtn.style.display = 'inline-block';
           copyResultBtn.style.display = 'inline-block';
 
-          // 如果返回了临时链接 id，则显示复制链接按钮
           if (result.id) {
             currentGeneratedId = result.id;
             copyLinkBtn.style.display = 'inline-block';
@@ -480,7 +556,6 @@ function getHTML() {
 // 需要排除的出站类型
 const EXCLUDED_TYPES = ['direct', 'selector', 'urltest', 'dns', 'block'];
 
-// 处理生成请求
 async function handleGenerate(request) {
   try {
     const body = await request.json();
@@ -511,13 +586,11 @@ async function handleGenerate(request) {
           throw new Error('无法识别的格式（需为数组或包含 outbounds 的对象）');
         }
 
-        // 过滤掉不需要的类型，保持 tag 原样
         const filtered = outbounds.filter(ob => {
           if (!ob || typeof ob !== 'object') return false;
           return !EXCLUDED_TYPES.includes(ob.type);
         });
 
-        // 不再添加前缀，直接使用原始 tag（无 tag 则标为 'unnamed'）
         const proxies = filtered.map(ob => ({
           ...ob,
           tag: ob.tag || 'unnamed',
@@ -547,7 +620,7 @@ async function handleGenerate(request) {
     const allGroups = [];
     const errors = [];
 
-    results.forEach(res => {
+results.forEach(res => {
       if (res.error) {
         errors.push('[' + res.name + '] ' + res.error);
       } else {
@@ -561,11 +634,9 @@ async function handleGenerate(request) {
     const { outbounds: _, ...restConfig } = config;
     const finalConfig = { ...restConfig, outbounds: finalOutbounds };
 
-    // 将完整配置存入临时缓存，并生成 id
     const id = crypto.randomUUID();
     configCache.set(id, JSON.stringify(finalConfig));
 
-    // 返回配置和 id
     return new Response(JSON.stringify({ id, config: finalConfig }), {
       status: 200,
       headers: {
@@ -583,4 +654,4 @@ async function handleGenerate(request) {
       },
     });
   }
-}
+  }
