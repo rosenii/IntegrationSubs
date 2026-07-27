@@ -1,4 +1,8 @@
 // _worker.js – Cloudflare Worker (ES modules format)
+
+// 全局内存存储（用于临时保存生成的配置，提供可访问的订阅链接）
+const configCache = new Map();
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -14,21 +18,44 @@ export default {
       });
     }
 
+    // 主页：返回前端界面
     if (path === '/' && request.method === 'GET') {
       return new Response(getHTML(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
     }
 
+    // API 生成接口
     if (path === '/api/generate' && request.method === 'POST') {
       return handleGenerate(request);
     }
 
+    // 获取临时生成的配置（订阅链接）
+    if (path.startsWith('/api/get/') && request.method === 'GET') {
+      const id = path.split('/api/get/')[1];
+      return handleGetConfig(id);
+    }
+
+    // 其他路径 404
     return new Response('Not Found', { status: 404 });
   },
 };
 
-// 前端 HTML 页面（包含 localStorage 缓存机制）
+// 处理临时配置获取请求
+function handleGetConfig(id) {
+  const config = configCache.get(id);
+  if (!config) {
+    return new Response('Config not found or expired', { status: 404 });
+  }
+  return new Response(config, {
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
+}
+
+// 前端 HTML（包含 localStorage 缓存 + 复制链接功能）
 function getHTML() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -127,6 +154,10 @@ function getHTML() {
       background: #5e5ce6;
     }
     .copy-btn:hover { background: #4b49cc; }
+    .link-btn {
+      background: #ff9500;
+    }
+    .link-btn:hover { background: #e68600; }
 
     .code-editor {
       width: 100%;
@@ -214,6 +245,7 @@ function getHTML() {
     <button id="generate" class="action-btn">⚡ 生成完整配置</button>
     <button id="download" class="action-btn" style="display:none;">⬇ 下载 JSON</button>
     <button id="copy-result" class="copy-btn" style="display:none;">📋 复制 JSON</button>
+    <button id="copy-link" class="link-btn" style="display:none;">🔗 复制订阅源链接</button>
   </div>
 
   <div id="status"></div>
@@ -237,7 +269,7 @@ function getHTML() {
             if (Array.isArray(arr) && arr.length > 0) return arr;
           }
         } catch (e) {}
-        return [{ name: 'HK', url: 'https://example.com/sub.json', type: 'selector' }]; // 默认一行
+        return [{ name: 'HK', url: 'https://example.com/sub.json', type: 'selector' }];
       }
 
       function saveSources(sourcesArray) {
@@ -252,18 +284,20 @@ function getHTML() {
         localStorage.setItem(STORAGE_KEY_CONFIG, text);
       }
 
-      // ---------- UI 元素 ----------
+      // UI 元素
       const sourcesContainer = document.getElementById('sources-container');
       const addBtn = document.getElementById('add-source');
       const generateBtn = document.getElementById('generate');
       const downloadBtn = document.getElementById('download');
-      const copyBtn = document.getElementById('copy-result');
+      const copyResultBtn = document.getElementById('copy-result');
+      const copyLinkBtn = document.getElementById('copy-link');
       const configInput = document.getElementById('config-input');
       const outputArea = document.getElementById('output');
       const resultDiv = document.getElementById('result');
       const statusDiv = document.getElementById('status');
 
-      // 收集当前所有订阅源数据
+      let currentGeneratedId = null;  // 保存最近一次生成返回的 id
+
       function collectSources() {
         const rows = document.querySelectorAll('.source-row');
         const sources = [];
@@ -271,14 +305,13 @@ function getHTML() {
           const name = row.querySelector('.name').value.trim();
           const url = row.querySelector('.url').value.trim();
           const type = row.querySelector('.type').value;
-          if (name || url) {  // 即使不完整也保存，以便恢复
+          if (name || url) {
             sources.push({ name, url, type });
           }
         });
         return sources;
       }
 
-      // 保存所有状态（防抖）
       let saveTimeout;
       function scheduleSave() {
         clearTimeout(saveTimeout);
@@ -288,7 +321,6 @@ function getHTML() {
         }, 300);
       }
 
-      // 创建一行订阅源 DOM
       function createSourceRow(name = '', url = '', type = 'selector') {
         const div = document.createElement('div');
         div.className = 'source-row';
@@ -302,13 +334,11 @@ function getHTML() {
           <span class="remove-btn-wrapper"><button class="remove-btn">✕</button></span>
         \`;
 
-        // 绑定删除事件
         div.querySelector('.remove-btn').addEventListener('click', () => {
           div.remove();
           scheduleSave();
         });
 
-        // 任何输入变化都触发保存
         div.querySelectorAll('input, select').forEach(el => {
           el.addEventListener('input', scheduleSave);
           el.addEventListener('change', scheduleSave);
@@ -317,7 +347,6 @@ function getHTML() {
         return div;
       }
 
-      // 根据数据渲染所有行
       function renderSources(sources) {
         sourcesContainer.innerHTML = '';
         sources.forEach(src => {
@@ -325,29 +354,26 @@ function getHTML() {
         });
       }
 
-      // 初始化页面：从缓存加载
       function initFromCache() {
         const sources = loadSources();
         renderSources(sources);
         configInput.value = loadConfig();
       }
 
-      // 添加按钮
       addBtn.addEventListener('click', () => {
         const row = createSourceRow();
         sourcesContainer.appendChild(row);
         scheduleSave();
       });
 
-      // 其他配置变化也保存
       configInput.addEventListener('input', scheduleSave);
 
-      // 生成按钮逻辑（与之前相同，但增加缓存保存）
       generateBtn.addEventListener('click', async () => {
         statusDiv.textContent = '';
         resultDiv.style.display = 'none';
         downloadBtn.style.display = 'none';
-        copyBtn.style.display = 'none';
+        copyResultBtn.style.display = 'none';
+        copyLinkBtn.style.display = 'none';
 
         const rows = document.querySelectorAll('.source-row');
         const sources = [];
@@ -373,7 +399,6 @@ function getHTML() {
           }
         }
 
-        // 生成前也保存一次当前状态
         saveSources(sources);
         saveConfig(configText);
 
@@ -394,11 +419,20 @@ function getHTML() {
           } else {
             statusDiv.innerHTML = '<span class="success">✅ 生成成功！</span>';
           }
-          const jsonStr = JSON.stringify(result, null, 2);
+
+          const jsonStr = JSON.stringify(result.config, null, 2);
           outputArea.value = jsonStr;
           resultDiv.style.display = 'block';
           downloadBtn.style.display = 'inline-block';
-          copyBtn.style.display = 'inline-block';
+          copyResultBtn.style.display = 'inline-block';
+
+          // 如果返回了临时链接 id，则显示复制链接按钮
+          if (result.id) {
+            currentGeneratedId = result.id;
+            copyLinkBtn.style.display = 'inline-block';
+          } else {
+            copyLinkBtn.style.display = 'none';
+          }
 
           downloadBtn.onclick = () => {
             const blob = new Blob([jsonStr], { type: 'application/json' });
@@ -408,14 +442,27 @@ function getHTML() {
             a.click();
           };
 
-          copyBtn.onclick = async () => {
+          copyResultBtn.onclick = async () => {
             try {
               await navigator.clipboard.writeText(jsonStr);
-              copyBtn.textContent = '✅ 已复制';
-              setTimeout(() => { copyBtn.textContent = '📋 复制 JSON'; }, 2000);
+              copyResultBtn.textContent = '✅ 已复制';
+              setTimeout(() => { copyResultBtn.textContent = '📋 复制 JSON'; }, 2000);
             } catch (err) {
-              copyBtn.textContent = '❌ 复制失败';
-              setTimeout(() => { copyBtn.textContent = '📋 复制 JSON'; }, 2000);
+              copyResultBtn.textContent = '❌ 复制失败';
+              setTimeout(() => { copyResultBtn.textContent = '📋 复制 JSON'; }, 2000);
+            }
+          };
+
+          copyLinkBtn.onclick = async () => {
+            if (!currentGeneratedId) return;
+            const link = location.origin + '/api/get/' + currentGeneratedId;
+            try {
+              await navigator.clipboard.writeText(link);
+              copyLinkBtn.textContent = '✅ 链接已复制';
+              setTimeout(() => { copyLinkBtn.textContent = '🔗 复制订阅源链接'; }, 2000);
+            } catch (err) {
+              copyLinkBtn.textContent = '❌ 复制失败';
+              setTimeout(() => { copyLinkBtn.textContent = '🔗 复制订阅源链接'; }, 2000);
             }
           };
         } catch (err) {
@@ -423,7 +470,6 @@ function getHTML() {
         }
       });
 
-      // 页面加载完毕，初始化
       initFromCache();
     })();
   </script>
@@ -465,14 +511,16 @@ async function handleGenerate(request) {
           throw new Error('无法识别的格式（需为数组或包含 outbounds 的对象）');
         }
 
+        // 过滤掉不需要的类型，保持 tag 原样
         const filtered = outbounds.filter(ob => {
           if (!ob || typeof ob !== 'object') return false;
           return !EXCLUDED_TYPES.includes(ob.type);
         });
 
+        // 不再添加前缀，直接使用原始 tag（无 tag 则标为 'unnamed'）
         const proxies = filtered.map(ob => ({
           ...ob,
-          tag: '[' + name + '] ' + (ob.tag || 'unnamed'),
+          tag: ob.tag || 'unnamed',
         }));
 
         const tags = proxies.map(p => p.tag);
@@ -513,7 +561,12 @@ async function handleGenerate(request) {
     const { outbounds: _, ...restConfig } = config;
     const finalConfig = { ...restConfig, outbounds: finalOutbounds };
 
-    return new Response(JSON.stringify(finalConfig, null, 2), {
+    // 将完整配置存入临时缓存，并生成 id
+    const id = crypto.randomUUID();
+    configCache.set(id, JSON.stringify(finalConfig));
+
+    // 返回配置和 id
+    return new Response(JSON.stringify({ id, config: finalConfig }), {
       status: 200,
       headers: {
         'Content-Type': 'application/json',
@@ -530,4 +583,4 @@ async function handleGenerate(request) {
       },
     });
   }
-                                          }
+}
