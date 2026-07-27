@@ -51,7 +51,7 @@ function handleGetConfig(id) {
   });
 }
 
-// 前端 HTML（IndexedDB 存储 + 文件导入）
+// 前端 HTML（IndexedDB 存储 + 文件导入 + JSON 容错）
 function getHTML() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -301,7 +301,7 @@ function getHTML() {
           });
         } catch (e) {
           console.warn('IndexedDB 保存失败，回退到 localStorage', e);
-          try { localStorage.setItem(STORAGE_KEY_CONFIG, text); } catch (_) {}
+          try { localStorage.setItem('singbox_merger_config', text); } catch (_) {}
         }
       }
 
@@ -317,13 +317,12 @@ function getHTML() {
           });
         } catch (e) {
           console.warn('IndexedDB 加载失败，尝试 localStorage', e);
-          return localStorage.getItem(STORAGE_KEY_CONFIG) || '';
+          return localStorage.getItem('singbox_merger_config') || '';
         }
       }
 
       // ========== localStorage 存储订阅源列表 ==========
       const STORAGE_KEY_SOURCES = 'singbox_merger_sources';
-      const STORAGE_KEY_CONFIG = 'singbox_merger_config'; // 仅作后备
 
       function loadSources() {
         try {
@@ -374,7 +373,7 @@ function getHTML() {
         clearTimeout(saveTimeout);
         saveTimeout = setTimeout(() => {
           saveSources(collectSources());
-          saveConfigToDB(configInput.value);  // 使用 IndexedDB
+          saveConfigToDB(configInput.value);
         }, 300);
       }
 
@@ -437,12 +436,25 @@ function getHTML() {
           const reader = new FileReader();
           reader.onload = (ev) => {
             configInput.value = ev.target.result;
-            scheduleSave();  // 触发保存
+            scheduleSave();
           };
           reader.readAsText(file);
         };
         input.click();
       });
+
+      // 解析 JSON 时自动修复常见错误（尾随逗号等）
+      function parseJSONSafe(text) {
+        // 去除对象/数组中最后一个元素后的逗号
+        let fixed = text.replace(/,(\\s*[}\\]])/g, '$1');
+        // 尝试解析，如果失败则抛出原始错误（带提示）
+        try {
+          return JSON.parse(fixed);
+        } catch (e) {
+          // 提供友好提示，指出可能的错误位置
+          throw new Error('JSON 无效：' + e.message + '\\n请检查标点（如末尾逗号）或使用 JSON 校验工具。');
+        }
+      }
 
       // 生成按钮逻辑
       generateBtn.addEventListener('click', async () => {
@@ -469,9 +481,9 @@ function getHTML() {
         const configText = configInput.value.trim();
         if (configText) {
           try {
-            configObj = JSON.parse(configText);
+            configObj = parseJSONSafe(configText);
           } catch (e) {
-            statusDiv.innerHTML = '<span class="error">其他配置 JSON 格式错误：' + e.message + '</span>';
+            statusDiv.innerHTML = '<span class="error">其他配置 ' + e.message + '</span>';
             return;
           }
         }
@@ -620,7 +632,7 @@ async function handleGenerate(request) {
     const allGroups = [];
     const errors = [];
 
-results.forEach(res => {
+    results.forEach(res => {
       if (res.error) {
         errors.push('[' + res.name + '] ' + res.error);
       } else {
@@ -654,4 +666,4 @@ results.forEach(res => {
       },
     });
   }
-  }
+}
