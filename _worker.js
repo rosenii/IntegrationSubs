@@ -53,7 +53,7 @@ export default {
   },
 };
 
-// 后端拉取多个订阅源并过滤代理节点
+// 后端拉取多个订阅源并过滤代理节点（增加去重与 default 判断）
 async function handleFetchProxies(request) {
   try {
     const body = await request.json();
@@ -93,14 +93,14 @@ async function handleFetchProxies(request) {
 
         const tags = proxies.map(p => p.tag);
         if (tags.length === 0) {
-          return { name, proxies: [], group: null, error: '该源无有效代理节点' };
+          return { name, url, proxies: [], group: null, error: '该源无有效代理节点' };
         }
 
+        // 暂不添加 default，之后统一处理
         const group = {
           type: type,
           tag: name,
           outbounds: tags,
-          default: tags[0],
         };
 
         return { name, url, proxies, group, error: null };
@@ -110,6 +110,41 @@ async function handleFetchProxies(request) {
     });
 
     const results = await Promise.all(fetchTasks);
+
+    // 全局去重：为重复 tag 添加源名称后缀
+    const globalTags = new Set();
+    results.forEach(res => {
+      if (res.error || !res.proxies) return;
+      res.proxies = res.proxies.map(proxy => {
+        let tag = proxy.tag;
+        if (globalTags.has(tag)) {
+          let newTag = tag + ' (' + res.name + ')';
+          let counter = 1;
+          while (globalTags.has(newTag)) {
+            counter++;
+            newTag = tag + ' (' + res.name + ' ' + counter + ')';
+          }
+          tag = newTag;
+        }
+        globalTags.add(tag);
+        return { ...proxy, tag };
+      });
+
+      // 重建组配置，仅 selector 添加 default
+      if (res.group) {
+        const newTags = res.proxies.map(p => p.tag);
+        const groupConfig = {
+          type: res.group.type,
+          tag: res.group.tag,
+          outbounds: newTags,
+        };
+        if (res.group.type === 'selector') {
+          groupConfig.default = newTags[0];
+        }
+        res.group = groupConfig;
+      }
+    });
+
     return new Response(JSON.stringify({ results }), {
       status: 200,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
@@ -173,7 +208,7 @@ async function handleGetLatest(env) {
   return new Response('尚未生成任何配置', { status: 404 });
 }
 
-// 前端 HTML（调用 /api/fetch 获取代理，其余功能保持不变）
+// 前端 HTML（与之前相同，略作调整以显示修复效果）
 function getHTML() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -628,7 +663,7 @@ function getHTML() {
         noLinkHint.style.display = 'none';
       }
 
- // 缓存状态指示器
+      // 缓存状态指示器
       async function updateCacheStatusIndicators() {
         const rows = document.querySelectorAll('.source-row');
         for (const row of rows) {
@@ -749,21 +784,17 @@ function getHTML() {
 
       // 从后端拉取一个源的代理（必要时缓存）
       async function fetchSourceProxiesFromBackend(sources) {
-        try {
-          const response = await fetch('/api/fetch', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sources }),
-          });
-          if (!response.ok) {
-            const err = await response.json().catch(() => ({}));
-            throw new Error(err.error || 'HTTP ' + response.status);
-          }
-          const data = await response.json();
-          return data.results; // 数组 [{name, url, proxies, group, error}]
-        } catch (e) {
-          throw e;
+        const response = await fetch('/api/fetch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sources }),
+        });
+        if (!response.ok) {
+          const err = await response.json().catch(() => ({}));
+          throw new Error(err.error || 'HTTP ' + response.status);
         }
+        const data = await response.json();
+        return data.results; // 数组 [{name, url, proxies, group, error}]
       }
 
       // 核心生成逻辑
@@ -802,7 +833,7 @@ function getHTML() {
 
         statusDiv.textContent = '正在请求后端拉取代理...';
 
-        // 决定哪些源需要从后端拉取（强制刷新则全部拉取，否则使用缓存）
+        // 决定哪些源需要从后端拉取
         const toFetch = [];
         const fromCacheResults = [];
 
@@ -822,7 +853,6 @@ function getHTML() {
           try {
             fetchedResults = await fetchSourceProxiesFromBackend(toFetch);
           } catch (e) {
-            // 后端整体请求失败，尝试对每个待拉取的源使用旧缓存
             for (const src of toFetch) {
               const cached = await getProxyCache(src.url);
               if (cached) {
@@ -839,11 +869,9 @@ function getHTML() {
         const allResults = [...fromCacheResults];
         for (const res of fetchedResults) {
           if (!res.error) {
-            // 成功拉取，更新缓存
             await saveProxyCache(res.url, res.proxies, res.group);
             allResults.push({ ...res, fromCache: false });
           } else {
-            // 拉取失败，尝试使用旧缓存
             const cached = await getProxyCache(res.url);
             if (cached) {
               allResults.push({ ...res, proxies: cached.proxies, group: cached.group, fromCache: true, error: res.error });
@@ -853,7 +881,6 @@ function getHTML() {
           }
         }
 
-        // 合并出站列表
         const allProxies = [];
         const allGroups = [];
         const errors = [];
@@ -947,4 +974,4 @@ function getHTML() {
   </script>
 </body>
 </html>`;
-}
+        }
